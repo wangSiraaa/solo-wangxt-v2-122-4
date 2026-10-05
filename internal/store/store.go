@@ -179,6 +179,33 @@ type PublishResult struct {
 // current pointer is moved, all before commit. Concurrent readers can
 // only observe the state before or after, never a mix.
 func (s *Store) Publish(ctx context.Context, rrs []dns.RR, note string, lim zone.Limits) (*PublishResult, error) {
+	return s.publishWithRetry(ctx, note, lim, func(*zone.Snapshot) ([]dns.RR, error) {
+		return rrs, nil
+	})
+}
+
+// PublishPatch atomically publishes a new version derived from the
+// current one by applying record-level ADD/DEL operations. The candidate
+// zone is built in memory from the locked current version and then goes
+// through exactly the same validation, changelog and single-transaction
+// publish as a full-file publish. If any operation fails (deleting a
+// record that does not exist, adding a record that creates a CNAME
+// conflict, ...) the error names the operation and nothing is published:
+// the serial does not move and no partial state is stored.
+func (s *Store) PublishPatch(ctx context.Context, ops []zone.PatchOp, note string, lim zone.Limits) (*PublishResult, error) {
+	return s.publishWithRetry(ctx, note, lim, func(prev *zone.Snapshot) ([]dns.RR, error) {
+		if prev == nil {
+			return nil, errors.New("no published version to patch; publish a full zone file first")
+		}
+		return zone.ApplyPatch(prev, ops)
+	})
+}
+
+// publishWithRetry runs publishOnce, retrying only on transaction
+// serialization failures. build derives the candidate RR set from the
+// locked current snapshot (nil when nothing was ever published); its
+// errors are deterministic and abort the publish immediately.
+func (s *Store) publishWithRetry(ctx context.Context, note string, lim zone.Limits, build func(prev *zone.Snapshot) ([]dns.RR, error)) (*PublishResult, error) {
 	var lastErr error
 	for attempt := 0; attempt < 10; attempt++ {
 		if attempt > 0 {
@@ -188,7 +215,7 @@ func (s *Store) Publish(ctx context.Context, rrs []dns.RR, note string, lim zone
 			case <-time.After(time.Duration(attempt*5) * time.Millisecond):
 			}
 		}
-		res, err := s.publishOnce(ctx, rrs, note, lim)
+		res, err := s.publishOnce(ctx, note, lim, build)
 		if err == nil {
 			return res, nil
 		}
@@ -203,7 +230,7 @@ func (s *Store) Publish(ctx context.Context, rrs []dns.RR, note string, lim zone
 	return nil, fmt.Errorf("publish gave up after serialization retries: %w", lastErr)
 }
 
-func (s *Store) publishOnce(ctx context.Context, rrs []dns.RR, note string, lim zone.Limits) (*PublishResult, error) {
+func (s *Store) publishOnce(ctx context.Context, note string, lim zone.Limits, build func(prev *zone.Snapshot) ([]dns.RR, error)) (*PublishResult, error) {
 	// Read Committed + SELECT ... FOR UPDATE on the singleton meta row:
 	// publishers queue on the row lock, and each one re-reads the current
 	// serial once it acquires the lock. The full RR set, changelog and
@@ -237,6 +264,13 @@ func (s *Store) publishOnce(ctx context.Context, rrs []dns.RR, note string, lim 
 		if err != nil {
 			return nil, err
 		}
+	}
+
+	// Derive the candidate RR set while holding the meta row lock, so a
+	// record patch always applies to the version it is serialized against.
+	rrs, err := build(prev)
+	if err != nil {
+		return nil, err
 	}
 
 	// Re-validate against configured TTL bounds and zone semantics.

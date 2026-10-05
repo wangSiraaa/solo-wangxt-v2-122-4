@@ -5,6 +5,7 @@
 //
 //	dnszone serve   --config config.json
 //	dnszone publish --config config.json --file zone.db [--note "..."]
+//	dnszone patch   --config config.json --file changes.patch [--note "..."]
 //	dnszone versions --config config.json
 package main
 
@@ -35,6 +36,8 @@ func main() {
 		err = runServe(args)
 	case "publish":
 		err = runPublish(args)
+	case "patch":
+		err = runPatch(args)
 	case "versions":
 		err = runVersions(args)
 	case "-h", "--help", "help":
@@ -55,6 +58,7 @@ func usage() {
 Commands:
   serve     run the authoritative UDP/TCP server
   publish   atomically publish a zone file as a new version
+  patch     atomically apply ADD/DEL record operations to the current version
   versions  list published zone versions
 
 Run "<command> -h" for command flags.
@@ -131,6 +135,56 @@ func runPublish(args []string) error {
 	defer st.Close()
 
 	res, err := st.Publish(ctx, rrs, *note, lim)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("published serial %d (%d record changes)\n", res.Serial, len(res.Changes))
+	for _, c := range res.Changes {
+		fmt.Printf("  %s %s\n", c.Action, zone.CanonicalText(c.RR))
+	}
+	return nil
+}
+
+// runPatch applies a record patch file (ADD/DEL lines) to the current
+// version and publishes the result as a new version. A failed patch
+// reports the offending operation and leaves the serial untouched.
+func runPatch(args []string) error {
+	fs := flag.NewFlagSet("patch", flag.ContinueOnError)
+	cfgPath := fs.String("config", "config.json", "path to config JSON")
+	file := fs.String("file", "", "patch file: ADD/DEL record lines applied to the current version")
+	note := fs.String("note", "", "change note stored with the version")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *file == "" {
+		return fmt.Errorf("-file is required (patch file with ADD/DEL record lines)")
+	}
+	cfg, err := loadConfig(*cfgPath)
+	if err != nil {
+		return err
+	}
+	f, err := os.Open(*file)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	lim := zone.Limits{MinTTL: cfg.TTLMin, MaxTTL: cfg.TTLMax}
+	ops, err := zone.ParsePatch(f, cfg.ZoneOrigin(), lim)
+	if err != nil {
+		return err
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	st, err := store.New(ctx, cfg.DatabaseURL, cfg.ZoneOrigin())
+	if err != nil {
+		return fmt.Errorf("postgres: %w", err)
+	}
+	defer st.Close()
+
+	res, err := st.PublishPatch(ctx, ops, *note, lim)
 	if err != nil {
 		return err
 	}

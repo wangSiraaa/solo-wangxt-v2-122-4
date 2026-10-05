@@ -1,0 +1,12 @@
+# Example record patch: turns a published zone-v1 into zone-v2 without
+# re-editing the master file. Applied with:
+#   dnszone patch -config config.json -file testdata/patch-v1-to-v2.patch
+#
+# Format (one operation per line):
+#   ADD|DEL <owner> <ttl> IN <type> <rdata>
+# Owners may be relative to the zone origin; every record needs an
+# explicit TTL; the SOA cannot be patched (serial is assigned on publish).
+ADD www 3600 IN A 127.0.0.22
+DEL www 3600 IN TXT "multi-record same name v1"
+ADD www 3600 IN TXT "multi-record same name v2"
+ADD host2 3600 IN A 127.0.0.30

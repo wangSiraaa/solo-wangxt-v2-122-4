@@ -17,6 +17,13 @@ internet:
   while holding a row lock on the version counter. The serving layer
   holds an immutable snapshot behind an `atomic.Pointer`; publication is
   one pointer swap, so a query can never observe half a version.
+- **Record patches.** Small changes ship as `ADD`/`DEL` record
+  operations against the current version instead of a re-edited master
+  file. The candidate zone is built in memory, then validated, logged
+  and published through the same atomic transaction as a full-file
+  publish. A bad operation — deleting a record that does not exist,
+  adding one that causes a CNAME conflict — is reported by name, nothing
+  is published and the serial does not move.
 - **Controlled zone transfers.** AXFR and IXFR are TCP-only, restricted
   to configured source CIDRs **and** require a valid
   [TSIG](https://datatracker.ietf.org/doc/html/rfc8945) signature
@@ -33,14 +40,15 @@ internet:
 ## Layout
 
 ```
-cmd/dnszone/         CLI: serve / publish / versions
+cmd/dnszone/         CLI: serve / publish / patch / versions
 internal/config/     JSON config (listeners, TTL bounds, ACL, TSIG keys)
 internal/zone/       master-file parsing, validation, immutable snapshots,
-                     lookup (CNAME chase + wildcards), version diffing
+                     lookup (CNAME chase + wildcards), version diffing,
+                     record-patch parsing and application
 internal/store/      PostgreSQL: versions, records, change log, LISTEN notify
 internal/server/     DNS handler: queries + AXFR/IXFR, TSIG/ACL gating
 scripts/             postgres bootstrap and dig verification
-testdata/            example zones and a TSIG key file
+testdata/            example zones, an example record patch and a TSIG key file
 ```
 
 ## Requirements
@@ -113,6 +121,42 @@ file (`dig -k`).
   an ahead-of-server client receives the current SOA, and a missing
   serial falls back to a full AXFR.
 
+## Record patches
+
+When only a few records change, patch the current version instead of
+re-editing the master file:
+
+```sh
+./bin/dnszone patch -config config.json -file testdata/patch-v1-to-v2.patch --note "v1->v2"
+```
+
+A patch file lists one operation per line; each operation names a
+complete record including its TTL:
+
+```
+# ADD|DEL <owner> <ttl> IN <type> <rdata>
+ADD host2 3600 IN A 127.0.0.30
+DEL www 3600 IN TXT "multi-record same name v1"
+ADD www 3600 IN TXT "multi-record same name v2"
+```
+
+- Owners may be relative to the zone origin (`www`, `@`) or absolute;
+  blank lines and `#`/`;` comments are ignored. The TTL is mandatory on
+  every record, and the SOA cannot be patched (its serial is assigned at
+  publish time).
+- Operations apply in order to an in-memory candidate built from the
+  current version. `DEL` must name a record that exists (owner, type,
+  rdata **and** TTL all match); `ADD` must not duplicate an existing
+  record and must not create a CNAME coexistence conflict (RFC 1034) or
+  an apex CNAME. A TTL change is a `DEL` plus an `ADD`.
+- The candidate then goes through the same zone validation, change-log
+  generation and single-transaction publish as a full-file publish, so
+  queries and AXFR/IXFR move to the new version together.
+- Any failing operation is reported by content (e.g. `patch op 1: DEL
+  nosuch.lab.test. 3600 IN A 127.0.0.99: no such record in current
+  version`), the whole patch is rejected, no partial result is
+  published and the serial does not move.
+
 ## Tests
 
 ```sh
@@ -121,13 +165,18 @@ go test -race ./...
 
 - `internal/zone`: TTL boundaries, same-name multi-records, CNAME
   conflicts, out-of-zone/unsupported-type rejection, CNAME chains,
-  wildcards, negative TTL, diff and AXFR ordering.
+  wildcards, negative TTL, diff and AXFR ordering, record-patch parsing
+  and application (missing-record deletes, CNAME conflicts, duplicate
+  adds, TTL changes).
 - `internal/server`: AA/no-recursion answers, NXDOMAIN/NODATA
-  authority, out-of-zone REFUSED, atomic snapshot swap, and TSIG+ACL
-  transfer gating over real DNS sockets.
+  authority, out-of-zone REFUSED, atomic snapshot swap, TSIG+ACL
+  transfer gating over real DNS sockets, and an end-to-end patch
+  release where queries and AXFR observe the same new version.
 - `internal/store` (runs against PostgreSQL; creates/uses
   `dnszone_test`): publish/load, rollback of invalid publishes,
-  concurrent publishing with no serial gaps, and change-log contents.
+  concurrent publishing with no serial gaps, change-log contents, and
+  record patches (mixed A+TXT patch, failed patches leaving the serial
+  untouched, full-file publish after a patch).
 
 An end-to-end `dig` checklist (flags, negatives, AXFR/IXFR content and
 TSIG bookends) lives at `scripts/verify-dig.sh`.
