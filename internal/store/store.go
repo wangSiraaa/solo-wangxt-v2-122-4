@@ -179,6 +179,33 @@ type PublishResult struct {
 // current pointer is moved, all before commit. Concurrent readers can
 // only observe the state before or after, never a mix.
 func (s *Store) Publish(ctx context.Context, rrs []dns.RR, note string, lim zone.Limits) (*PublishResult, error) {
+	return s.publishWithRetry(ctx, rrs, note, lim, -1)
+}
+
+// ErrPatchBaseMoved means the current zone version changed after a patch
+// candidate was built in memory. The candidate is discarded without
+// publishing; the caller must rebuild it from the new current version.
+var ErrPatchBaseMoved = errors.New("zone version moved while applying record patch")
+
+// PublishPatch applies explicit ADD/DEL operations to the currently
+// published version. The candidate zone is constructed and validated in
+// memory before entering the publication transaction; if any operation is
+// invalid, PublishPatch returns the operation error(s) and allocates no
+// serial. A successful call uses the same transaction, changelog and
+// notify path as Publish.
+func (s *Store) PublishPatch(ctx context.Context, ops []zone.Operation, note string, lim zone.Limits) (*PublishResult, error) {
+	base, err := s.LoadCurrent(ctx)
+	if err != nil {
+		return nil, err
+	}
+	candidate, err := zone.ApplyPatch(base, ops, lim)
+	if err != nil {
+		return nil, err
+	}
+	return s.publishWithRetry(ctx, candidate.RRs, note, lim, int64(base.Serial))
+}
+
+func (s *Store) publishWithRetry(ctx context.Context, rrs []dns.RR, note string, lim zone.Limits, expectedBase int64) (*PublishResult, error) {
 	var lastErr error
 	for attempt := 0; attempt < 10; attempt++ {
 		if attempt > 0 {
@@ -188,9 +215,14 @@ func (s *Store) Publish(ctx context.Context, rrs []dns.RR, note string, lim zone
 			case <-time.After(time.Duration(attempt*5) * time.Millisecond):
 			}
 		}
-		res, err := s.publishOnce(ctx, rrs, note, lim)
+		res, err := s.publishOnce(ctx, rrs, note, lim, expectedBase)
 		if err == nil {
 			return res, nil
+		}
+		if errors.Is(err, ErrPatchBaseMoved) {
+			// Rebasing a record patch could publish a different operator
+			// intent; fail the explicit request without allocating a serial.
+			return nil, err
 		}
 		// 40001 = serialization_failure, 40P01 = deadlock_detected.
 		var pgErr *pgconn.PgError
@@ -203,7 +235,7 @@ func (s *Store) Publish(ctx context.Context, rrs []dns.RR, note string, lim zone
 	return nil, fmt.Errorf("publish gave up after serialization retries: %w", lastErr)
 }
 
-func (s *Store) publishOnce(ctx context.Context, rrs []dns.RR, note string, lim zone.Limits) (*PublishResult, error) {
+func (s *Store) publishOnce(ctx context.Context, rrs []dns.RR, note string, lim zone.Limits, expectedBase int64) (*PublishResult, error) {
 	// Read Committed + SELECT ... FOR UPDATE on the singleton meta row:
 	// publishers queue on the row lock, and each one re-reads the current
 	// serial once it acquires the lock. The full RR set, changelog and
@@ -219,6 +251,10 @@ func (s *Store) publishOnce(ctx context.Context, rrs []dns.RR, note string, lim 
 	if err := tx.QueryRow(ctx,
 		`SELECT current_serial FROM zone_meta WHERE id = 1 FOR UPDATE`).Scan(&prevSerial); err != nil {
 		return nil, err
+	}
+	if expectedBase >= 0 && prevSerial != expectedBase {
+		return nil, fmt.Errorf("%w: candidate built from serial %d, current serial is %d",
+			ErrPatchBaseMoved, expectedBase, prevSerial)
 	}
 
 	var prev *zone.Snapshot

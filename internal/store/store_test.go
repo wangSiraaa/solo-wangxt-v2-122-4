@@ -234,6 +234,128 @@ func TestChangelogDrivesIXFRDelta(t *testing.T) {
 	}
 }
 
+func TestPatchPublishesAndFullPublishStillWorks(t *testing.T) {
+	s := freshStore(t)
+	ctx := context.Background()
+	lim := zone.Limits{MinTTL: 30, MaxTTL: 86400}
+	if _, err := s.Publish(ctx, parse(t, content(0)), "v1", lim); err != nil {
+		t.Fatal(err)
+	}
+
+	ops, err := zone.ParsePatch(strings.NewReader(`
+DEL www.lab.test. 3600 IN A 127.0.0.21
+ADD www.lab.test. 3600 IN TXT "patched in serial 2"
+ADD host2.lab.test. 3600 IN A 127.0.0.30
+`), origin)
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := s.PublishPatch(ctx, ops, "record patch", lim)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Serial != 2 {
+		t.Fatalf("patch serial = %d, want 2", res.Serial)
+	}
+	snap, err := s.LoadCurrent(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := snap.Lookup("www.lab.test.", dns.TypeA); len(got) != 1 {
+		t.Fatalf("www A after patch = %d records", len(got))
+	}
+	if got, _ := snap.Lookup("www.lab.test.", dns.TypeTXT); len(got) != 1 {
+		t.Fatalf("www TXT after patch = %d records", len(got))
+	}
+	if got, found := snap.Lookup("host2.lab.test.", dns.TypeA); !found || len(got) != 1 {
+		t.Fatal("patch ADD is queryable in the published snapshot")
+	}
+	changes, err := s.LoadChanges(ctx, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var adds, dels int
+	for _, c := range changes {
+		switch c.Action {
+		case "ADD":
+			adds++
+		case "DEL":
+			dels++
+		}
+	}
+	if adds != 2 || dels != 1 {
+		t.Fatalf("patch changelog adds=%d dels=%d, want 2/1", adds, dels)
+	}
+
+	// A later full master-file publish follows the same normal path and
+	// becomes serial 3.
+	if _, err := s.Publish(ctx, parse(t, content(2)), "full v3", lim); err != nil {
+		t.Fatal(err)
+	}
+	snap, err = s.LoadCurrent(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snap.Serial != 3 || snap.SOA().Serial != 3 {
+		t.Fatalf("full publish after patch serial = %d", snap.Serial)
+	}
+}
+
+func TestFailedPatchDoesNotIncreaseSerial(t *testing.T) {
+	s := freshStore(t)
+	ctx := context.Background()
+	lim := zone.Limits{MinTTL: 30, MaxTTL: 86400}
+	if _, err := s.Publish(ctx, parse(t, content(0)), "v1", lim); err != nil {
+		t.Fatal(err)
+	}
+
+	ops, err := zone.ParsePatch(strings.NewReader(`
+ADD host2.lab.test. 3600 IN CNAME www.lab.test.
+DEL missing.lab.test. 3600 IN A 127.0.0.99
+`), origin)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.PublishPatch(ctx, ops, "bad patch", lim); err == nil {
+		t.Fatal("invalid patch must fail")
+	}
+	serial, err := s.CurrentSerial(ctx)
+	if err != nil || serial != 1 {
+		t.Fatalf("after failed patch serial=%d err=%v, want 1", serial, err)
+	}
+	cnameOps, err := zone.ParsePatch(strings.NewReader(`ADD www.lab.test. 3600 IN CNAME host2.lab.test.`), origin)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.PublishPatch(ctx, cnameOps, "cname conflict", lim); err == nil {
+		t.Fatal("CNAME conflict patch must fail")
+	}
+	serial, err = s.CurrentSerial(ctx)
+	if err != nil || serial != 1 {
+		t.Fatalf("after conflict patch serial=%d err=%v, want 1", serial, err)
+	}
+	var n int
+	if err := s.pool.QueryRow(ctx, `SELECT count(*) FROM zone_versions`).Scan(&n); err != nil || n != 1 {
+		t.Fatalf("versions rows=%d err=%v, want 1", n, err)
+	}
+	ghostChanges, err := s.LoadChanges(ctx, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ghostChanges) != 0 {
+		t.Fatalf("failed patch inserted a serial-2 changelog: %#v", ghostChanges)
+	}
+
+	// Also reject before opening the publication path when no version exists.
+	s2 := freshStore(t)
+	if _, err := s2.PublishPatch(ctx, ops, "before first", lim); err == nil {
+		t.Fatal("patch against no current version must fail")
+	}
+	if serial, err := s2.CurrentSerial(ctx); err != nil || serial != 0 {
+		t.Fatalf("baseless patch serial=%d err=%v, want 0", serial, err)
+	}
+}
+
 // content returns a zone text where variant adds `variant` extra host
 // records, giving each publish a distinct-but-related RR set.
 func content(variant int) string {

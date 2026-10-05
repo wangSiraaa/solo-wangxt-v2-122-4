@@ -13,6 +13,7 @@ import (
 	"github.com/miekg/dns"
 
 	"localtest/dnszone/internal/config"
+	"localtest/dnszone/internal/store"
 	"localtest/dnszone/internal/zone"
 )
 
@@ -258,6 +259,230 @@ func mustConfig(t *testing.T) *config.Config {
 		t.Fatal(err)
 	}
 	return cfg
+}
+
+func TestE2EPatchSnapshotServedByQueryAndAXFR(t *testing.T) {
+	base := snap(t, 7, testZone)
+	ops, err := zone.ParsePatch(strings.NewReader(`
+DEL www.lab.test. 3600 IN A 127.0.0.21
+ADD www.lab.test. 3600 IN TXT "patched while serving"
+ADD host3.lab.test. 3600 IN A 127.0.0.33
+`), "lab.test.")
+	if err != nil {
+		t.Fatal(err)
+	}
+	candidate, err := zone.ApplyPatch(base, ops, zone.Limits{MinTTL: 30, MaxTTL: 86400})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The store rewrites the SOA serial on publication; emulate that on
+	// the immutable snapshot before the single serving-pointer swap.
+	published, err := zone.NewSnapshot("lab.test.", 8, candidate.RRs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := newTestServer(t, published)
+
+	if r := dnsQuery(t, addr, "udp", "lab.test.", dns.TypeSOA); r.Answer[0].(*dns.SOA).Serial != 8 {
+		t.Fatal("query did not see patched serial 8")
+	}
+	if r := dnsQuery(t, addr, "udp", "www.lab.test.", dns.TypeA); len(r.Answer) != 1 {
+		t.Fatalf("patched www A answers=%d, want 1", len(r.Answer))
+	}
+	if r := dnsQuery(t, addr, "udp", "www.lab.test.", dns.TypeTXT); len(r.Answer) != 1 {
+		t.Fatalf("patched www TXT answers=%d, want 1", len(r.Answer))
+	}
+	if r := dnsQuery(t, addr, "tcp", "host3.lab.test.", dns.TypeA); len(r.Answer) != 1 {
+		t.Fatalf("patched host3 A answers=%d, want 1", len(r.Answer))
+	}
+
+	tr := new(dns.Transfer)
+	tr.TsigSecret = map[string]string{"xfer.lab.test.": testTSIGB64}
+	q := new(dns.Msg)
+	q.SetQuestion("lab.test.", dns.TypeAXFR)
+	q.SetTsig("xfer.lab.test.", dns.HmacSHA256, 300, time.Now().Unix())
+	env, err := tr.In(q, addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var axfr []dns.RR
+	for e := range env {
+		if e.Error != nil {
+			t.Fatal(e.Error)
+		}
+		axfr = append(axfr, e.RR...)
+	}
+	if axfr[0].(*dns.SOA).Serial != 8 || axfr[len(axfr)-1].(*dns.SOA).Serial != 8 {
+		t.Fatal("AXFR did not use patched serial 8 for both SOA bookends")
+	}
+	var sawHost3, sawPatchedTXT, sawRemovedA bool
+	for _, rr := range axfr {
+		switch v := rr.(type) {
+		case *dns.A:
+			if v.Hdr.Name == "host3.lab.test." && v.A.String() == "127.0.0.33" {
+				sawHost3 = true
+			}
+			if v.Hdr.Name == "www.lab.test." && v.A.String() == "127.0.0.21" {
+				sawRemovedA = true
+			}
+		case *dns.TXT:
+			if v.Hdr.Name == "www.lab.test." && len(v.Txt) > 0 && v.Txt[0] == "patched while serving" {
+				sawPatchedTXT = true
+			}
+		}
+	}
+	if !sawHost3 || !sawPatchedTXT {
+		t.Fatalf("AXFR missing patched records: host3=%v txt=%v", sawHost3, sawPatchedTXT)
+	}
+	if sawRemovedA {
+		t.Fatal("AXFR still contains the deleted www A 127.0.0.21")
+	}
+}
+
+func TestE2EStorePatchVisibleToQueryAndAXFR(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	st, err := store.New(ctx, "postgres://dnsadmin@127.0.0.1:55432/dnszone_server_test?sslmode=disable&connect_timeout=2", "lab.test.")
+	if err != nil {
+		t.Skipf("test database unavailable: %v", err)
+	}
+	t.Cleanup(st.Close)
+
+	lim := zone.Limits{MinTTL: 30, MaxTTL: 86400}
+	rrs, err := zone.Parse(strings.NewReader(testZone), "lab.test.", lim)
+	if err != nil {
+		t.Fatal(err)
+	}
+	base, err := st.Publish(ctx, rrs, "server patch base", lim)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := mustConfig(t)
+	srv, err := New(ctx, cfg, st, log.New(io.Discard, "", 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	pc, err := net.ListenPacket("udp", ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	serveCtx, stopServe := context.WithCancel(ctx)
+	t.Cleanup(func() {
+		stopServe()
+		pc.Close()
+		ln.Close()
+	})
+	go srv.Serve(serveCtx, pc, ln)
+	addr := ln.Addr().String()
+	waitForServer(t, addr)
+
+	ops, err := zone.ParsePatch(strings.NewReader(`
+DEL www.lab.test. 3600 IN A 127.0.0.21
+ADD www.lab.test. 3600 IN TXT "store patch served identically"
+ADD host4.lab.test. 3600 IN A 127.0.0.34
+`), "lab.test.")
+	if err != nil {
+		t.Fatal(err)
+	}
+	patch, err := st.PublishPatch(ctx, ops, "server patch", lim)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if patch.Serial != base.Serial+1 {
+		t.Fatalf("patched serial = %d, base = %d", patch.Serial, base.Serial)
+	}
+	waitForSOASerial(t, addr, patch.Serial)
+
+	if r := dnsQuery(t, addr, "udp", "www.lab.test.", dns.TypeA); len(r.Answer) != 1 {
+		t.Fatalf("query www A = %d answers after patch", len(r.Answer))
+	}
+	if r := dnsQuery(t, addr, "tcp", "www.lab.test.", dns.TypeTXT); len(r.Answer) != 1 {
+		t.Fatalf("query www TXT = %d answers after patch", len(r.Answer))
+	}
+	if r := dnsQuery(t, addr, "udp", "host4.lab.test.", dns.TypeA); len(r.Answer) != 1 {
+		t.Fatalf("query host4 A = %d answers after patch", len(r.Answer))
+	}
+	if r := dnsQuery(t, addr, "udp", "lab.test.", dns.TypeSOA); r.Answer[0].(*dns.SOA).Serial != patch.Serial {
+		t.Fatal("query serial does not match patched version")
+	}
+
+	axfr := signedAXFR(t, addr)
+	if axfr[0].(*dns.SOA).Serial != patch.Serial || axfr[len(axfr)-1].(*dns.SOA).Serial != patch.Serial {
+		t.Fatal("AXFR serial does not match the patched version")
+	}
+	var host4s, txts, removedAs int
+	for _, rr := range axfr {
+		switch v := rr.(type) {
+		case *dns.A:
+			if v.Hdr.Name == "host4.lab.test." {
+				host4s++
+			}
+			if v.Hdr.Name == "www.lab.test." && v.A.String() == "127.0.0.21" {
+				removedAs++
+			}
+		case *dns.TXT:
+			if v.Hdr.Name == "www.lab.test." && len(v.Txt) > 0 && v.Txt[0] == "store patch served identically" {
+				txts++
+			}
+		}
+	}
+	if host4s != 1 || txts != 1 || removedAs != 0 {
+		t.Fatalf("AXFR content host4=%d txt=%d removedA=%d", host4s, txts, removedAs)
+	}
+}
+
+func waitForServer(t *testing.T, addr string) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		c := new(dns.Client)
+		c.Timeout = 100 * time.Millisecond
+		m := new(dns.Msg)
+		m.SetQuestion("lab.test.", dns.TypeSOA)
+		if _, _, err := c.Exchange(m, addr); err == nil {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatal("test DNS server did not become ready")
+}
+
+func waitForSOASerial(t *testing.T, addr string, serial uint32) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if r := dnsQuery(t, addr, "udp", "lab.test.", dns.TypeSOA); r.Answer[0].(*dns.SOA).Serial == serial {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("server did not hot-reload serial %d", serial)
+}
+
+func signedAXFR(t *testing.T, addr string) []dns.RR {
+	t.Helper()
+	tr := new(dns.Transfer)
+	tr.TsigSecret = map[string]string{"xfer.lab.test.": testTSIGB64}
+	q := new(dns.Msg)
+	q.SetQuestion("lab.test.", dns.TypeAXFR)
+	q.SetTsig("xfer.lab.test.", dns.HmacSHA256, 300, time.Now().Unix())
+	env, err := tr.In(q, addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var all []dns.RR
+	for e := range env {
+		if e.Error != nil {
+			t.Fatal(e.Error)
+		}
+		all = append(all, e.RR...)
+	}
+	return all
 }
 
 func TestE2ETransferGateAndContent(t *testing.T) {

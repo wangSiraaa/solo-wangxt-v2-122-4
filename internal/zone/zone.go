@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/miekg/dns"
@@ -299,10 +300,20 @@ func validateSet(rrs []dns.RR, origin string) error {
 }
 
 // Key identifies a resource record independently of its TTL: same owner,
-// type and rdata body. Used for diffs.
+// type and rdata body. Used for set membership while patches check whether
+// an existing RR is being replaced at a different TTL.
 func rrKey(rr dns.RR) string {
 	h := rr.Header()
 	return strings.ToLower(h.Name) + "|" + dns.TypeToString[h.Rrtype] + "|" + canonicalRdata(rr)
+}
+
+// diffKey identifies a resource record including its TTL. IXFR changes the
+// cache state for a TTL-only replacement, so DEL/ADD rows must preserve the
+// old and new TTLs rather than treating such a pair as unchanged.
+func diffKey(rr dns.RR) string {
+	h := rr.Header()
+	return strings.ToLower(h.Name) + "|" + dns.TypeToString[h.Rrtype] + "|" +
+		strconv.FormatUint(uint64(h.Ttl), 10) + "|" + canonicalRdata(rr)
 }
 
 // canonicalRdata renders rdata without the owner/TTL/class/type prefix.
@@ -337,7 +348,7 @@ func Diff(old, new *Snapshot) []Change {
 			if rr.Header().Rrtype == dns.TypeSOA {
 				continue
 			}
-			dst[rrKey(rr)] = rr
+			dst[diffKey(rr)] = rr
 		}
 	}
 	collect(old, oldSet)
@@ -362,7 +373,7 @@ func sortChanges(ch []Change) {
 		if ch[i].Action != ch[j].Action {
 			return ch[i].Action == "DEL" // DEL before ADD
 		}
-		return rrKey(ch[i].RR) < rrKey(ch[j].RR)
+		return diffKey(ch[i].RR) < diffKey(ch[j].RR)
 	})
 }
 

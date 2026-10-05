@@ -5,6 +5,7 @@
 //
 //	dnszone serve   --config config.json
 //	dnszone publish --config config.json --file zone.db [--note "..."]
+//	dnszone patch   --config config.json --patch records.patch [--note "..."]
 //	dnszone versions --config config.json
 package main
 
@@ -35,6 +36,8 @@ func main() {
 		err = runServe(args)
 	case "publish":
 		err = runPublish(args)
+	case "patch":
+		err = runPatch(args)
 	case "versions":
 		err = runVersions(args)
 	case "-h", "--help", "help":
@@ -54,7 +57,8 @@ func usage() {
 
 Commands:
   serve     run the authoritative UDP/TCP server
-  publish   atomically publish a zone file as a new version
+  publish   atomically publish a full zone file as a new version
+  patch     atomically publish ADD/DEL changes against the current version
   versions  list published zone versions
 
 Run "<command> -h" for command flags.
@@ -135,6 +139,48 @@ func runPublish(args []string) error {
 		return err
 	}
 	fmt.Printf("published serial %d (%d record changes)\n", res.Serial, len(res.Changes))
+	for _, c := range res.Changes {
+		fmt.Printf("  %s %s\n", c.Action, zone.CanonicalText(c.RR))
+	}
+	return nil
+}
+
+func runPatch(args []string) error {
+	fs := flag.NewFlagSet("patch", flag.ContinueOnError)
+	cfgPath := fs.String("config", "config.json", "path to config JSON")
+	patchPath := fs.String("patch", "records.patch", "ADD/DEL record patch file")
+	note := fs.String("note", "", "change note stored with the version")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	cfg, err := loadConfig(*cfgPath)
+	if err != nil {
+		return err
+	}
+	f, err := os.Open(*patchPath)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	ops, err := zone.ParsePatch(f, cfg.ZoneOrigin())
+	if err != nil {
+		return err
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	st, err := store.New(ctx, cfg.DatabaseURL, cfg.ZoneOrigin())
+	if err != nil {
+		return fmt.Errorf("postgres: %w", err)
+	}
+	defer st.Close()
+
+	lim := zone.Limits{MinTTL: cfg.TTLMin, MaxTTL: cfg.TTLMax}
+	res, err := st.PublishPatch(ctx, ops, *note, lim)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("patched serial %d (%d record changes)\n", res.Serial, len(res.Changes))
 	for _, c := range res.Changes {
 		fmt.Printf("  %s %s\n", c.Action, zone.CanonicalText(c.RR))
 	}

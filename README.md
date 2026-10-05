@@ -33,7 +33,7 @@ internet:
 ## Layout
 
 ```
-cmd/dnszone/         CLI: serve / publish / versions
+cmd/dnszone/         CLI: serve / publish / patch / versions
 internal/config/     JSON config (listeners, TTL bounds, ACL, TSIG keys)
 internal/zone/       master-file parsing, validation, immutable snapshots,
                      lookup (CNAME chase + wildcards), version diffing
@@ -66,6 +66,30 @@ testdata/            example zones and a TSIG key file
    go build -o bin/dnszone ./cmd/dnszone
    ./bin/dnszone publish -config config.json -file testdata/zone-v1.db --note v1
    ```
+
+   For a handful of record changes, patch the current version instead of
+   re-editing and republishing the whole master file:
+
+   ```sh
+   ./bin/dnszone patch -config config.json -patch my.patch --note "hotfix"
+   ```
+
+   Patch lines are line-oriented and must each name one complete RR with
+   an explicit TTL:
+
+   ```dns
+   ADD host.lab.test. 300 IN A 127.0.0.70
+   DEL old.lab.test. 3600 IN TXT "removed text"
+   ```
+
+   The patch is applied to the loaded current snapshot in memory to build
+   a candidate zone. Missing `DEL` targets, duplicate `ADD`s, TTL-bound or
+   out-of-zone records, CNAME coexistence conflicts and other candidate
+   validation failures name the responsible ADD/DEL line and abort before
+   publication; no serial is allocated. Successful patches use the same
+   transaction, changelog, serial and atomic pointer swap as a full-file
+   publish. A later `publish` of a complete master file continues to work
+   and simply gets the next serial.
 
 3. Serve:
 
@@ -101,9 +125,12 @@ file (`dig -k`).
 
 ## Atomicity and transfers
 
-- Each successful publish gets a monotonically increasing serial (the
-  SOA serial is rewritten to it) and a stored change log (`ADD`/`DEL`
-  rows) derived from the previous version, excluding the SOA itself.
+- Each successful full-file publish or record patch gets a monotonically
+  increasing serial (the SOA serial is rewritten to it) and a stored
+  change log (`ADD`/`DEL` rows, including each record's TTL) derived from
+  the previous version, excluding the SOA itself. Record patches build
+  the candidate in memory first; any operation error aborts before the
+  publication transaction and therefore does not consume a serial.
 - **AXFR** emits the complete version bracketed by identical SOA RRs.
   Because the handler captures the snapshot pointer once per request, a
   transfer that starts before a publish finishes keeps streaming the
@@ -126,8 +153,9 @@ go test -race ./...
   authority, out-of-zone REFUSED, atomic snapshot swap, and TSIG+ACL
   transfer gating over real DNS sockets.
 - `internal/store` (runs against PostgreSQL; creates/uses
-  `dnszone_test`): publish/load, rollback of invalid publishes,
-  concurrent publishing with no serial gaps, and change-log contents.
+  `dnszone_test`): publish/load, record patches, rollback of invalid
+  publishes and patches, concurrent publishing with no serial gaps, and
+  change-log contents.
 
 An end-to-end `dig` checklist (flags, negatives, AXFR/IXFR content and
 TSIG bookends) lives at `scripts/verify-dig.sh`.
